@@ -1,0 +1,28 @@
+{
+  "name": "overview",
+  "version": "0.1.0",
+  "description": "CLI tool that generates a per-file code index to help AI agents navigate codebases with fewer tokens",
+  "type": "module",
+  "bin": {
+    "overview": "./dist/bin/overview.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx bin/overview.ts",
+    "start": "node dist/bin/overview.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.88.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.0",
+    "ignore": "^6.0.0",
+    "openai": "^4.73.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
