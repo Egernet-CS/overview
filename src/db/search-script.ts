@@ -7,10 +7,12 @@ export function generateSearchScript(dbFilename: string): string {
 #   .overview/search "query"                  search everything
 #   .overview/search "query" --only files     only files
 #   .overview/search "query" --only symbols   only functions/classes
+#   .overview/search "query" --only modules   compact module summaries
 #   .overview/search "query" --only imports   only import relations
 #   .overview/search "query" --module Auth    filter by module
 #   .overview/search "query" --kind view      filter by kind
-#   .overview/search "query" --limit 20       more results (default: 10)
+#   .overview/search "query" --with-imports   include imports in mixed search output
+#   .overview/search "query" --limit 20       more results (default: 5)
 
 DB="$(dirname "$0")/${dbFilename}"
 
@@ -44,13 +46,15 @@ QUERY=""
 ONLY=""
 MODULE=""
 KIND=""
-LIMIT=10
+WITH_IMPORTS=0
+LIMIT=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --only)   ONLY="$2"; shift 2 ;;
     --module) MODULE="$2"; shift 2 ;;
     --kind)   KIND="$2"; shift 2 ;;
+    --with-imports) WITH_IMPORTS=1; shift ;;
     --limit)  LIMIT="$2"; shift 2 ;;
     -h|--help)
       grep "^#" "$0" | sed 's/^# //;s/^#//'
@@ -64,7 +68,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$QUERY" ]; then
-  echo "Usage: .overview/search \\"query\\" [--only files|symbols|imports] [--module name] [--kind kind] [--limit n]" >&2
+  echo "Usage: .overview/search \\"query\\" [--only files|symbols|modules|imports] [--module name] [--kind kind] [--with-imports] [--limit n]" >&2
   exit 1
 fi
 
@@ -107,11 +111,30 @@ FROM (
     f.updated_at,
     f.has_error
   FROM files f
-  WHERE f.rowid IN (
-    SELECT rowid FROM files_fts
-    WHERE files_fts MATCH '"$SAFE_QUERY"'
+  WHERE (
+    f.rowid IN (
+      SELECT rowid FROM files_fts
+      WHERE files_fts MATCH '"$SAFE_QUERY"'
+    )
+    OR lower(f.path) LIKE lower('%$SAFE_QUERY%')
+    OR lower(f.description) LIKE lower('%$SAFE_QUERY%')
+    OR EXISTS (
+      SELECT 1
+      FROM json_each(f.tags)
+      WHERE lower(value) LIKE lower('%$SAFE_QUERY%')
+    )
   )
   $MOD_FILTER $KIND_FILTER
+  ORDER BY
+    CASE
+      WHEN lower(f.path) = lower('$SAFE_QUERY') THEN 5
+      WHEN lower(f.path) LIKE lower('$SAFE_QUERY%') THEN 4
+      WHEN lower(f.path) LIKE lower('%$SAFE_QUERY%') THEN 3
+      WHEN lower(f.description) LIKE lower('%$SAFE_QUERY%') THEN 2
+      ELSE 1
+    END DESC,
+    length(f.path),
+    f.path
   LIMIT $LIMIT
 );
 SQL
@@ -139,11 +162,26 @@ FROM (
     f.kind
   FROM symbols s
   JOIN files f ON f.path = s.file_path
-  WHERE s.id IN (
-    SELECT rowid FROM symbols_fts
-    WHERE symbols_fts MATCH '"$SAFE_QUERY"'
+  WHERE (
+    s.id IN (
+      SELECT rowid FROM symbols_fts
+      WHERE symbols_fts MATCH '"$SAFE_QUERY"'
+    )
+    OR lower(s.name) LIKE lower('%$SAFE_QUERY%')
+    OR lower(s.description) LIKE lower('%$SAFE_QUERY%')
+    OR lower(s.file_path) LIKE lower('%$SAFE_QUERY%')
   )
   $MOD_FILTER $KIND_FILTER
+  ORDER BY
+    CASE
+      WHEN lower(s.name) = lower('$SAFE_QUERY') THEN 5
+      WHEN lower(s.name) LIKE lower('$SAFE_QUERY%') THEN 4
+      WHEN lower(s.name) LIKE lower('%$SAFE_QUERY%') THEN 3
+      WHEN lower(s.file_path) LIKE lower('%$SAFE_QUERY%') THEN 2
+      ELSE 1
+    END DESC,
+    COALESCE(s.line, 999999),
+    s.file_path
   LIMIT $LIMIT
 );
 SQL
@@ -168,6 +206,65 @@ FROM (
 SQL
 }
 
+search_modules() {
+  cat <<SQL | run_sql
+SELECT COALESCE(json_group_array(json_object(
+  'module', module,
+  'fileCount', file_count,
+  'symbolCount', symbol_count,
+  'sampleFiles', json(sample_files),
+  'summary', summary
+)), '[]')
+FROM (
+  SELECT
+    m.module,
+    m.file_count,
+    (
+      SELECT COUNT(*)
+      FROM symbols s
+      JOIN files f2 ON f2.path = s.file_path
+      WHERE f2.module = m.module
+    ) AS symbol_count,
+    COALESCE((
+      SELECT json_group_array(path)
+      FROM (
+        SELECT path
+        FROM files
+        WHERE module = m.module
+        ORDER BY path
+        LIMIT 3
+      )
+    ), '[]') AS sample_files,
+    printf(
+      '%d files | %d symbols',
+      m.file_count,
+      (
+        SELECT COUNT(*)
+        FROM symbols s
+        JOIN files f3 ON f3.path = s.file_path
+        WHERE f3.module = m.module
+      )
+    ) AS summary
+  FROM (
+    SELECT module, COUNT(*) AS file_count
+    FROM files
+    WHERE module != ''
+    GROUP BY module
+  ) m
+  WHERE lower(m.module) LIKE lower('%$SAFE_QUERY%')
+  ORDER BY
+    CASE
+      WHEN lower(m.module) = lower('$SAFE_QUERY') THEN 3
+      WHEN lower(m.module) LIKE lower('$SAFE_QUERY%') THEN 2
+      ELSE 1
+    END DESC,
+    m.file_count DESC,
+    m.module
+  LIMIT $LIMIT
+);
+SQL
+}
+
 case "$ONLY" in
   files)
     FILES="$(search_files)"
@@ -177,19 +274,29 @@ case "$ONLY" in
     SYMBOLS="$(search_symbols)"
     printf '{"query":"%s","symbols":%s}\\n' "$QUERY" "$(json_or_empty "$SYMBOLS")"
     ;;
+  modules)
+    MODULES="$(search_modules)"
+    printf '{"query":"%s","modules":%s}\\n' "$QUERY" "$(json_or_empty "$MODULES")"
+    ;;
   imports)
     IMPORTS="$(search_imports)"
     printf '{"query":"%s","imports":%s}\\n' "$QUERY" "$(json_or_empty "$IMPORTS")"
     ;;
   "")
+    MODULES="$(search_modules)"
     FILES="$(search_files)"
     SYMBOLS="$(search_symbols)"
-    IMPORTS="$(search_imports)"
-    printf '{"query":"%s","files":%s,"symbols":%s,"imports":%s}\\n' \\
-      "$QUERY" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")" "$(json_or_empty "$IMPORTS")"
+    if [ "$WITH_IMPORTS" = "1" ]; then
+      IMPORTS="$(search_imports)"
+      printf '{"query":"%s","modules":%s,"files":%s,"symbols":%s,"imports":%s}\\n' \\
+        "$QUERY" "$(json_or_empty "$MODULES")" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")" "$(json_or_empty "$IMPORTS")"
+    else
+      printf '{"query":"%s","modules":%s,"files":%s,"symbols":%s,"imports":[]}\\n' \\
+        "$QUERY" "$(json_or_empty "$MODULES")" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")"
+    fi
     ;;
   *)
-    echo "Unknown --only: $ONLY (use: files, symbols, imports)" >&2
+    echo "Unknown --only: $ONLY (use: files, symbols, modules, imports)" >&2
     exit 1
     ;;
 esac

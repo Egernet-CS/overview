@@ -2,9 +2,9 @@
 
 CLI tool that generates a compact, searchable code index so AI agents can navigate large codebases using fewer tokens.
 
-Instead of reading every source file, the AI runs `.overview/search "query"` and gets back only the files, symbols, and imports that match — no JSON files to parse, no index to load upfront.
+Instead of reading every source file, the AI runs `.overview/search "query"` and gets back only the modules, files, and symbols that match. Imports are opt-in, and `overview inspect` gives a narrow file/symbol view before opening full source.
 
-The intended workflow is: search first, then open only the 1-3 most relevant files.
+The intended workflow is: search first, inspect second, then open only the 1-3 most relevant files.
 
 ## How it works
 
@@ -23,12 +23,14 @@ This scans the codebase and creates:
 The `search` script can be called directly by an AI agent or from the command line:
 
 ```bash
-.overview/search "login"                          # files + symbols + imports matching "login"
+.overview/search "login"                          # modules + files + symbols matching "login"
 .overview/search "AuthService" --only imports     # who imports AuthService
+.overview/search "Recipes" --only modules         # compact module summaries
 .overview/search "LoginViewModel" --only symbols  # find a class or function
 .overview/search "auth" --module Norlys           # scoped to one module
 .overview/search "view" --kind viewmodel          # filter by architectural kind
-.overview/search "login" --limit 20              # more results (default: 10)
+.overview/search "login" --with-imports           # include imports in mixed output
+.overview/search "login" --limit 20               # more results (default: 5)
 ```
 
 Output is a single JSON object:
@@ -36,15 +38,16 @@ Output is a single JSON object:
 ```json
 {
   "query": "login",
+  "modules": [
+    { "module": "Auth", "fileCount": 12, "symbolCount": 34, "summary": "12 files | 34 symbols", "sampleFiles": ["Features/Auth/LoginViewModel.swift"] }
+  ],
   "files": [
     { "path": "Features/Auth/LoginViewModel.swift", "module": "Auth", "kind": "viewmodel", "description": "login state auth flow", "tags": ["auth","login","session"] }
   ],
   "symbols": [
     { "name": "login", "type": "method", "description": "authenticates user", "file": "Features/Auth/LoginViewModel.swift", "line": 45 }
   ],
-  "imports": [
-    { "direction": "used_by", "path": "Features/Auth/LoginView.swift" }
-  ]
+  "imports": []
 }
 ```
 
@@ -83,6 +86,9 @@ npm run dev -- index --dir ./my-project
 
 # Search from the CLI
 npm run dev -- search "login"
+npm run dev -- search "login" --with-imports
+npm run dev -- modules Auth
+npm run dev -- inspect LoginViewModel --type symbol
 npm run dev -- search "AuthService" --only imports
 
 # Show stats for an existing index
@@ -101,9 +107,27 @@ For day-to-day use, treat `.overview/search` as the entry point:
 .overview/search "login"
 .overview/search "CommonEnvironment" --only symbols
 .overview/search "popular recipes" --module Recipes --limit 5
+npm run dev -- inspect CommonEnvironment --type symbol
 ```
 
 That keeps exploration cheap. The point is not that the index exists, but that agents can narrow the search space before opening full source files.
+
+### Inspect before opening source
+
+`overview inspect` is the narrow second step after search. It returns:
+
+- file metadata
+- exported/public symbols
+- import neighborhood
+- a small source snippet around the focused symbol or match
+
+Examples:
+
+```bash
+npm run dev -- inspect LoginViewModel --type symbol
+npm run dev -- inspect src/features/auth/login.ts --type file
+npm run dev -- inspect Auth --type module
+```
 
 ### Stop and resume
 
@@ -154,4 +178,5 @@ Settings are loaded in order: `~/.overview/.env` → `.env` → CLI flags.
 - `.overview/` is generated output and should normally not be committed
 - The `search` script requires `sqlite3` (available by default on macOS; `brew install sqlite` on Linux)
 - The database uses WAL mode and a short busy timeout to make parallel reads more robust
+- Mixed search output omits imports by default to keep responses smaller; use `--with-imports` or `--only imports` when needed
 - `imports` tracks relative file paths for TS/JS and module names for Swift/Python

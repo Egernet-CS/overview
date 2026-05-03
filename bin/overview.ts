@@ -12,8 +12,9 @@ import { FileAnalyzer } from '../src/indexer/analyzer.js';
 import { Semaphore } from '../src/indexer/concurrency.js';
 import { hashContent } from '../src/indexer/cache.js';
 import { initDb } from '../src/db/schema.js';
-import { isIndexed, upsertFile, search, getStats } from '../src/db/store.js';
+import { isIndexed, upsertFile, search, inspect, listModules, getStats } from '../src/db/store.js';
 import { generateSearchScript } from '../src/db/search-script.js';
+import { buildSnippet } from '../src/inspect/snippet.js';
 import type { LlmClient, OverviewConfig } from '../src/types.js';
 
 const DB_FILENAME = 'index.db';
@@ -133,12 +134,13 @@ program
   .command('search <query>')
   .description('Search the code index')
   .option('--out <dir>', 'Output directory (default: .overview)')
-  .option('--only <type>', 'files | symbols | imports')
+  .option('--only <type>', 'files | symbols | imports | modules')
   .option('--module <name>', 'Filter by module')
   .option('--kind <kind>', 'Filter by kind (view, viewmodel, client, ...)')
+  .option('--with-imports', 'Include import relations in default search output')
   .option('--limit <n>', 'Max results per section', parseInt)
   .action(async (query: string, opts: {
-    out?: string; only?: string; module?: string; kind?: string; limit?: number;
+    out?: string; only?: string; module?: string; kind?: string; limit?: number; withImports?: boolean;
   }) => {
     const outDir = resolve(opts.out ?? '.overview');
     const dbPath = join(outDir, DB_FILENAME);
@@ -156,9 +158,91 @@ program
       module: opts.module,
       kind: opts.kind,
       limit: opts.limit,
+      withImports: opts.withImports,
     });
 
     console.log(JSON.stringify(result, null, 2));
+    db.close();
+  });
+
+// ─── inspect ──────────────────────────────────────────────────────────────────
+
+program
+  .command('inspect <query>')
+  .description('Inspect a file, symbol, or module without opening full source by default')
+  .option('--out <dir>', 'Output directory (default: .overview)')
+  .option('--dir <path>', 'Project root for reading source snippets (default: cwd)')
+  .option('--type <type>', 'auto | file | symbol | module', 'auto')
+  .option('--context <n>', 'Lines of context around the focused match', parseInt)
+  .action(async (query: string, opts: {
+    out?: string; dir?: string; type?: 'auto' | 'file' | 'symbol' | 'module'; context?: number;
+  }) => {
+    const rootDir = resolve(opts.dir ?? process.cwd());
+    const outDir = resolve(opts.out ?? join(rootDir, '.overview'));
+    const dbPath = join(outDir, DB_FILENAME);
+
+    let db;
+    try {
+      db = initDb(dbPath);
+    } catch {
+      console.error(chalk.red(`  No index found at ${dbPath}. Run: overview index`));
+      process.exit(1);
+    }
+
+    const result = inspect(db, query, {
+      type: opts.type,
+    });
+
+    if (result.status === 'ok' && result.result && result.result.kind !== 'module') {
+      const inspectResult = result.result;
+      const snippet = await buildSnippet(
+        join(rootDir, inspectResult.file.path),
+        inspectResult.file.path,
+        {
+          focusLine: inspectResult.focusLine,
+          query,
+          context: opts.context ?? 8,
+        },
+      );
+
+      console.log(JSON.stringify({
+        ...result,
+        result: {
+          ...inspectResult,
+          snippet,
+        },
+      }, null, 2));
+    } else {
+      console.log(JSON.stringify(result, null, 2));
+    }
+
+    db.close();
+  });
+
+// ─── modules ──────────────────────────────────────────────────────────────────
+
+program
+  .command('modules [query]')
+  .description('List compact module summaries')
+  .option('--out <dir>', 'Output directory (default: .overview)')
+  .option('--limit <n>', 'Max module results', parseInt)
+  .action(async (query: string | undefined, opts: { out?: string; limit?: number }) => {
+    const outDir = resolve(opts.out ?? '.overview');
+    const dbPath = join(outDir, DB_FILENAME);
+
+    let db;
+    try {
+      db = initDb(dbPath);
+    } catch {
+      console.error(chalk.red(`  No index found at ${dbPath}. Run: overview index`));
+      process.exit(1);
+    }
+
+    const modules = listModules(db, query ?? '', opts.limit);
+    console.log(JSON.stringify({
+      query: query ?? '',
+      modules,
+    }, null, 2));
     db.close();
   });
 
