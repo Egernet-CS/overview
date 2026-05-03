@@ -4,6 +4,8 @@ CLI tool that generates a compact, searchable code index so AI agents can naviga
 
 Instead of reading every source file, the AI runs `.overview/search "query"` and gets back only the files, symbols, and imports that match — no JSON files to parse, no index to load upfront.
 
+The intended workflow is: search first, then open only the 1-3 most relevant files.
+
 ## How it works
 
 ```
@@ -76,6 +78,9 @@ npm run dev -- index --dir ./my-project --llm claude
 # Re-analyze all files (default: skips files whose hash matches the DB)
 npm run dev -- index --dir ./my-project --force
 
+# Update an existing index in place
+npm run dev -- index --dir ./my-project
+
 # Search from the CLI
 npm run dev -- search "login"
 npm run dev -- search "AuthService" --only imports
@@ -88,9 +93,25 @@ npm run build
 node dist/bin/overview.js index --dir ./my-project
 ```
 
+### Search-first workflow
+
+For day-to-day use, treat `.overview/search` as the entry point:
+
+```bash
+.overview/search "login"
+.overview/search "CommonEnvironment" --only symbols
+.overview/search "popular recipes" --module Recipes --limit 5
+```
+
+That keeps exploration cheap. The point is not that the index exists, but that agents can narrow the search space before opening full source files.
+
 ### Stop and resume
 
 Indexing can be interrupted at any time with Ctrl+C. Each file is written to the database immediately after analysis. Restarting without `--force` skips files whose content hash already exists in the database.
+
+### Updating an existing index
+
+Running `overview index` again updates the existing `.overview/index.db` in place. Unchanged files are skipped automatically based on content hash, so you no longer need a separate incremental mode.
 
 ### All options
 
@@ -130,5 +151,7 @@ Settings are loaded in order: `~/.overview/.env` → `.env` → CLI flags.
 - Binary files are automatically skipped (by extension and content detection)
 - `node_modules`, `.git`, `Pods`, `DerivedData`, `dist`, `build` are always excluded
 - `.gitignore` rules are respected
+- `.overview/` is generated output and should normally not be committed
 - The `search` script requires `sqlite3` (available by default on macOS; `brew install sqlite` on Linux)
+- The database uses WAL mode and a short busy timeout to make parallel reads more robust
 - `imports` tracks relative file paths for TS/JS and module names for Swift/Python

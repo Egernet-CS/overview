@@ -51,7 +51,7 @@ export interface FileRow {
   layer: string;
   kind: string;
   description: string;
-  tags: string;
+  tags: string[];
   llm: string;
   updated_at: string;
   has_error: number;
@@ -62,7 +62,7 @@ export interface SymbolRow {
   type: string;
   description: string;
   line: number | null;
-  file_path: string;
+  file: string;
   module: string;
   kind: string;
 }
@@ -87,38 +87,34 @@ export function search(
   const limit = opts.limit ?? 10;
   const ftsQuery = escapeFtsQuery(query);
 
-  let moduleFilter = '';
-  let kindFilter = '';
-  const extraParams: string[] = [];
-
-  if (opts.module) {
-    moduleFilter = 'AND f.module = ?';
-    extraParams.push(opts.module);
-  }
-  if (opts.kind) {
-    kindFilter = 'AND f.kind = ?';
-    extraParams.push(opts.kind);
-  }
+  const filterSql = [
+    opts.module ? 'AND f.module = ?' : '',
+    opts.kind ? 'AND f.kind = ?' : '',
+  ].filter(Boolean).join(' ');
+  const filterParams = [opts.module, opts.kind].filter((value): value is string => Boolean(value));
 
   const files: FileRow[] = opts.only && opts.only !== 'files' ? [] : (
-    db.prepare(`
+    (db.prepare(`
       SELECT f.path, f.module, f.layer, f.kind, f.description, f.tags, f.llm, f.updated_at, f.has_error
       FROM files f
       WHERE f.rowid IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
-      ${moduleFilter} ${kindFilter}
+      ${filterSql}
       LIMIT ?
-    `).all(ftsQuery, ...extraParams, limit) as FileRow[]
+    `).all(ftsQuery, ...filterParams, limit) as Array<Omit<FileRow, 'tags'> & { tags: string }>).map(row => ({
+      ...row,
+      tags: parseTags(row.tags),
+    }))
   );
 
   const symbols: SymbolRow[] = opts.only && opts.only !== 'symbols' ? [] : (
     db.prepare(`
-      SELECT s.name, s.type, s.description, s.line, s.file_path, f.module, f.kind
+      SELECT s.name, s.type, s.description, s.line, s.file_path as file, f.module, f.kind
       FROM symbols s
       JOIN files f ON f.path = s.file_path
       WHERE s.id IN (SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?)
-      ${moduleFilter.replace(/f\.module/, 'f.module')} ${kindFilter.replace(/f\.kind/, 'f.kind')}
+      ${filterSql}
       LIMIT ?
-    `).all(ftsQuery, ...extraParams, limit) as SymbolRow[]
+    `).all(ftsQuery, ...filterParams, limit) as SymbolRow[]
   );
 
   const likeQuery = `%${query.replace(/%/g, '\\%').replace(/_/g, '\\_')}%`;
@@ -153,4 +149,13 @@ function escapeFtsQuery(query: string): string {
   // Otherwise pass through (allows FTS5 syntax like AND, OR, *)
   if (/\bAND\b|\bOR\b|\bNOT\b|[*"()^]/.test(query)) return query;
   return `"${query.replace(/"/g, '""')}"`;
+}
+
+function parseTags(raw: string): string[] {
+  try {
+    const tags = JSON.parse(raw) as unknown;
+    return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : [];
+  } catch {
+    return [];
+  }
 }
