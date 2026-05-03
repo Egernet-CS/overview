@@ -12,7 +12,7 @@ export interface OverviewConfig {
   outDir: string;
   rootDir: string;
   excludePatterns: string[];
-  incremental: boolean;
+  force: boolean;
 }
 
 export interface FileSymbol {
@@ -24,23 +24,15 @@ export interface FileSymbol {
 
 export interface FileDetail {
   path: string;
+  module: string;
+  layer: string;
+  kind: string;
   description: string;
+  tags: string[];
   symbols: FileSymbol[];
   imports: string[];
   hash: string;
   error?: string;
-}
-
-export interface IndexEntry {
-  path: string;
-  description: string;
-}
-
-export interface OverviewIndex {
-  version: number;
-  generated: string;
-  llm: string;
-  files: IndexEntry[];
 }
 
 export interface ScannedFile {
@@ -51,6 +43,10 @@ export interface ScannedFile {
 
 export interface LlmFileAnalysis {
   description: string;
+  module?: string;
+  layer?: string;
+  kind?: string;
+  tags?: string[];
   symbols: Array<{
     name: string;
     type: string;

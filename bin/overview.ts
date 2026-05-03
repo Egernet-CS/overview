@@ -2,7 +2,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { resolve, join } from 'path';
-import { readFile } from 'fs/promises';
+import { mkdir, writeFile, chmod } from 'fs/promises';
 import { loadConfig } from '../src/config.js';
 import { ClaudeClient } from '../src/llm/claude.js';
 import { LocalClient } from '../src/llm/local.js';
@@ -10,39 +10,39 @@ import { checkLocalLlmHealth } from '../src/llm/health.js';
 import { walkFiles } from '../src/scanner/walker.js';
 import { FileAnalyzer } from '../src/indexer/analyzer.js';
 import { Semaphore } from '../src/indexer/concurrency.js';
-import { loadCachedDetail, isCacheValid, hashContent } from '../src/indexer/cache.js';
-import { writeFileDetail } from '../src/output/file-writer.js';
-import { writeIndex } from '../src/output/index-writer.js';
-import type { LlmClient, FileDetail, OverviewConfig } from '../src/types.js';
+import { hashContent } from '../src/indexer/cache.js';
+import { initDb } from '../src/db/schema.js';
+import { isIndexed, upsertFile, search, getStats } from '../src/db/store.js';
+import { generateSearchScript } from '../src/db/search-script.js';
+import type { LlmClient, OverviewConfig } from '../src/types.js';
+
+const DB_FILENAME = 'index.db';
+const SEARCH_FILENAME = 'search';
 
 const program = new Command();
 
 program
   .name('overview')
-  .description('Generate a per-file code index for AI agents')
-  .version('0.1.0');
+  .description('Generate a searchable code index for AI agents')
+  .version('0.2.0');
+
+// ─── index ────────────────────────────────────────────────────────────────────
 
 program
   .command('index', { isDefault: true })
-  .description('Scan a directory and generate .overview/ index files')
+  .description('Scan a directory and build .overview/index.db')
   .option('--dir <path>', 'Directory to scan (default: cwd)')
   .option('--out <dir>', 'Output directory (default: .overview)')
-  .option('--llm <mode>', 'LLM to use: claude|local|auto (default: auto)')
+  .option('--llm <mode>', 'LLM: claude|local|auto (default: auto)')
   .option('--concurrency <n>', 'Parallel LLM calls', parseInt)
-  .option('--incremental', 'Skip files whose content has not changed')
+  .option('--force', 'Re-analyze all files, ignore cached hashes')
   .option('--model <model>', 'Claude model override')
-  .option('--local-url <url>', 'Local LLM server URL override')
-  .option('--local-model <model>', 'Local LLM model name override')
-  .option('--exclude <pattern>', 'Extra glob patterns to exclude (repeatable)', collect, [])
+  .option('--local-url <url>', 'Local LLM server URL')
+  .option('--local-model <model>', 'Local LLM model name')
+  .option('--exclude <pattern>', 'Extra glob excludes (repeatable)', collect, [])
   .action(async (opts: {
-    dir?: string;
-    out?: string;
-    llm?: string;
-    concurrency?: number;
-    incremental?: boolean;
-    model?: string;
-    localUrl?: string;
-    localModel?: string;
+    dir?: string; out?: string; llm?: string; concurrency?: number;
+    force?: boolean; model?: string; localUrl?: string; localModel?: string;
     exclude: string[];
   }) => {
     const config = loadConfig({
@@ -50,7 +50,7 @@ program
       outDir: opts.out,
       llmMode: opts.llm as OverviewConfig['llmMode'],
       concurrency: opts.concurrency,
-      incremental: opts.incremental,
+      force: opts.force,
       claudeModel: opts.model,
       localLlmUrl: opts.localUrl,
       localLlmModel: opts.localModel,
@@ -58,14 +58,16 @@ program
     });
 
     const outDir = resolve(config.rootDir, config.outDir);
+    await mkdir(outDir, { recursive: true });
 
-    // Resolve LLM
+    const dbPath = join(outDir, DB_FILENAME);
+    const db = initDb(dbPath);
+
     const llmClient = await resolveLlm(config);
 
     console.error(chalk.cyan(`  Scanning ${config.rootDir}`));
-    console.error(chalk.gray(`  LLM: ${llmClient.getModelName()} | concurrency: ${config.concurrency} | out: ${config.outDir}`));
+    console.error(chalk.gray(`  LLM: ${llmClient.getModelName()} | concurrency: ${config.concurrency} | db: ${dbPath}`));
 
-    // Walk files
     const files = await walkFiles(config.rootDir, config.excludePatterns);
     console.error(chalk.gray(`  Found ${files.length} files`));
 
@@ -73,43 +75,38 @@ program
     await analyzer.init();
 
     const sem = new Semaphore(config.concurrency);
-    const results: FileDetail[] = [];
     let done = 0;
     let cached = 0;
     let errors = 0;
 
     const tasks = files.map(file => sem.run(async () => {
-      // Incremental: check cache
-      if (config.incremental) {
-        const { readFile: rf } = await import('fs/promises');
-        let content: string;
-        try {
-          content = await rf(file.absolutePath, 'utf8');
-        } catch {
-          done++;
-          return;
-        }
-        const hash = hashContent(content);
-        const cached_ = await loadCachedDetail(outDir, file.relativePath);
-        if (cached_ && isCacheValid(cached_, hash)) {
-          results.push(cached_);
-          cached++;
-          done++;
-          printProgress(done, files.length, cached, errors);
-          return;
-        }
+      let content: string;
+      try {
+        const { readFile } = await import('fs/promises');
+        content = await readFile(file.absolutePath, 'utf8');
+      } catch {
+        done++;
+        return;
+      }
+
+      const hash = hashContent(content);
+
+      if (!config.force && isIndexed(db, file.relativePath, hash)) {
+        cached++;
+        done++;
+        printProgress(done, files.length, cached, errors);
+        return;
       }
 
       const result = await analyzer.analyze(file);
       done++;
 
       if (result.status === 'ok') {
-        await writeFileDetail(outDir, result.detail);
-        results.push(result.detail);
+        upsertFile(db, result.detail, llmClient.getModelName());
         if (result.detail.error) errors++;
       } else if (result.status === 'error') {
         errors++;
-        process.stderr.write(chalk.yellow(`  [warn] ${file.relativePath}: ${result.error}\n`));
+        process.stderr.write(chalk.yellow(`\n  [warn] ${file.relativePath}: ${result.error}`));
       }
 
       printProgress(done, files.length, cached, errors);
@@ -117,36 +114,84 @@ program
 
     await Promise.all(tasks);
 
-    // Write index
-    await writeIndex(outDir, results, llmClient.getModelName());
+    // Write search script
+    const scriptPath = join(outDir, SEARCH_FILENAME);
+    await writeFile(scriptPath, generateSearchScript(DB_FILENAME), 'utf8');
+    await chmod(scriptPath, 0o755);
 
     process.stderr.write('\n');
-    console.error(chalk.green(`  Done. ${results.length} files indexed, ${cached} from cache, ${errors} errors.`));
-    console.error(chalk.gray(`  Index: ${join(outDir, 'index.json')}`));
+    const stats = getStats(db);
+    console.error(chalk.green(`  Done. ${stats.files} files, ${stats.symbols} symbols | ${cached} cached, ${errors} errors`));
+    console.error(chalk.gray(`  Search: ${scriptPath} "your query"`));
+
+    db.close();
   });
+
+// ─── search ───────────────────────────────────────────────────────────────────
+
+program
+  .command('search <query>')
+  .description('Search the code index')
+  .option('--out <dir>', 'Output directory (default: .overview)')
+  .option('--only <type>', 'files | symbols | imports')
+  .option('--module <name>', 'Filter by module')
+  .option('--kind <kind>', 'Filter by kind (view, viewmodel, client, ...)')
+  .option('--limit <n>', 'Max results per section', parseInt)
+  .action(async (query: string, opts: {
+    out?: string; only?: string; module?: string; kind?: string; limit?: number;
+  }) => {
+    const outDir = resolve(opts.out ?? '.overview');
+    const dbPath = join(outDir, DB_FILENAME);
+
+    let db;
+    try {
+      db = initDb(dbPath);
+    } catch {
+      console.error(chalk.red(`  No index found at ${dbPath}. Run: overview index`));
+      process.exit(1);
+    }
+
+    const result = search(db, query, {
+      only: opts.only,
+      module: opts.module,
+      kind: opts.kind,
+      limit: opts.limit,
+    });
+
+    console.log(JSON.stringify(result, null, 2));
+    db.close();
+  });
+
+// ─── status ───────────────────────────────────────────────────────────────────
 
 program
   .command('status')
-  .description('Show stats for the existing .overview/ index')
+  .description('Show stats for the existing .overview/index.db')
   .option('--out <dir>', 'Output directory (default: .overview)')
   .action(async (opts: { out?: string }) => {
     const outDir = resolve(opts.out ?? '.overview');
+    const dbPath = join(outDir, DB_FILENAME);
+
+    let db;
     try {
-      const raw = await readFile(join(outDir, 'index.json'), 'utf8');
-      const index = JSON.parse(raw) as { version: number; generated: string; llm: string; files: unknown[] };
-      console.log(chalk.cyan('Overview index'));
-      console.log(`  Files:     ${index.files.length}`);
-      console.log(`  LLM:       ${index.llm}`);
-      console.log(`  Generated: ${index.generated}`);
+      db = initDb(dbPath);
     } catch {
-      console.error(chalk.red('  No index found. Run: overview index'));
+      console.error(chalk.red(`  No index found. Run: overview index`));
       process.exit(1);
     }
+
+    const stats = getStats(db);
+    console.log(chalk.cyan('Overview index'));
+    console.log(`  Files:    ${stats.files}`);
+    console.log(`  Symbols:  ${stats.symbols}`);
+    console.log(`  LLM:      ${stats.llm}`);
+    console.log(`  Updated:  ${stats.updated}`);
+    db.close();
   });
 
 program.parse();
 
-// Helpers
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
 async function resolveLlm(config: OverviewConfig): Promise<LlmClient> {
   if (config.llmMode === 'claude') {
@@ -163,7 +208,6 @@ async function resolveLlm(config: OverviewConfig): Promise<LlmClient> {
     return local;
   }
 
-  // auto: try local first, fall back to Claude
   const health = await checkLocalLlmHealth(config);
   if (health.available) {
     const local = new LocalClient(config);
@@ -174,7 +218,6 @@ async function resolveLlm(config: OverviewConfig): Promise<LlmClient> {
 
   if (!config.anthropicApiKey) {
     console.error(chalk.red('  Error: Local LLM unavailable and no ANTHROPIC_API_KEY set.'));
-    console.error(chalk.gray('  Start LM Studio or set ANTHROPIC_API_KEY in ~/.overview/.env'));
     process.exit(1);
   }
 

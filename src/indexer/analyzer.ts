@@ -9,7 +9,6 @@ import { hashContent } from './cache.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export class FileAnalyzer {
-  private promptTemplate: string = '';
   private systemPrompt: string = '';
 
   constructor(
@@ -18,11 +17,10 @@ export class FileAnalyzer {
   ) {}
 
   async init(): Promise<void> {
-    this.promptTemplate = await readFile(
+    this.systemPrompt = await readFile(
       join(__dirname, '../../prompts/analyze-file.md'),
       'utf8',
     );
-    this.systemPrompt = this.promptTemplate;
   }
 
   async analyze(file: ScannedFile): Promise<ProcessingResult> {
@@ -59,7 +57,11 @@ export class FileAnalyzer {
     if (!analysis) {
       const detail: FileDetail = {
         path: file.relativePath,
-        description: 'Analysis failed.',
+        module: inferModule(file.relativePath),
+        layer: 'other',
+        kind: 'other',
+        description: 'analysis failed',
+        tags: [],
         symbols: [],
         imports,
         hash,
@@ -77,7 +79,11 @@ export class FileAnalyzer {
 
     const detail: FileDetail = {
       path: file.relativePath,
+      module: analysis.module ?? inferModule(file.relativePath),
+      layer: analysis.layer ?? 'other',
+      kind: analysis.kind ?? 'other',
       description: analysis.description,
+      tags: Array.isArray(analysis.tags) ? analysis.tags : [],
       symbols,
       imports,
       hash,
@@ -87,13 +93,11 @@ export class FileAnalyzer {
   }
 
   private parseResponse(raw: string): LlmFileAnalysis {
-    // Try direct parse first
     const trimmed = raw.trim();
     try {
       return JSON.parse(trimmed) as LlmFileAnalysis;
     } catch { /* fall through */ }
 
-    // Extract JSON object from response (handles markdown fences or extra prose)
     const start = trimmed.indexOf('{');
     const end = trimmed.lastIndexOf('}');
     if (start !== -1 && end > start) {
@@ -110,4 +114,9 @@ export class FileAnalyzer {
     const lower = raw.toLowerCase() as FileSymbol['type'];
     return valid.includes(lower) ? lower : 'other';
   }
+}
+
+function inferModule(relativePath: string): string {
+  const parts = relativePath.split('/');
+  return parts.length > 1 ? parts[0] : 'root';
 }

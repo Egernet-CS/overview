@@ -21,6 +21,6 @@ export function loadConfig(overrides: Partial<OverviewConfig> = {}): OverviewCon
     outDir: overrides.outDir ?? process.env.OVERVIEW_OUT_DIR ?? '.overview',
     rootDir: overrides.rootDir ?? process.cwd(),
     excludePatterns: overrides.excludePatterns ?? [],
-    incremental: overrides.incremental ?? false,
+    force: overrides.force ?? false,
   };
 }
