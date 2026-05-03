@@ -1,8 +1,8 @@
 # overview
 
-CLI tool that generates a compact per-file code index so AI agents can navigate large codebases using fewer tokens.
+CLI tool that generates a compact, searchable code index so AI agents can navigate large codebases using fewer tokens.
 
-Instead of reading every source file, the AI reads a small `.overview/index.json` to find relevant files, then reads individual `.overview/<path>.json` files to see symbols and dependencies — only opening actual source files when needed.
+Instead of reading every source file, the AI runs `.overview/search "query"` and gets back only the files, symbols, and imports that match — no JSON files to parse, no index to load upfront.
 
 ## How it works
 
@@ -14,37 +14,35 @@ This scans the codebase and creates:
 
 ```
 .overview/
-├── index.json                  # All files with a one-line description
-├── src/
-│   ├── router/
-│   │   └── router.ts.json      # Symbols + imports for router.ts
-│   └── config.ts.json
-└── ...
+├── index.db      # SQLite database (files, symbols, imports + FTS5 full-text search)
+└── search        # Executable bash script — the AI's entry point
 ```
 
-**`index.json`** — the AI's entry point (small, one entry per file):
+The `search` script can be called directly by an AI agent or from the command line:
+
+```bash
+.overview/search "login"                          # files + symbols + imports matching "login"
+.overview/search "AuthService" --only imports     # who imports AuthService
+.overview/search "LoginViewModel" --only symbols  # find a class or function
+.overview/search "auth" --module Norlys           # scoped to one module
+.overview/search "view" --kind viewmodel          # filter by architectural kind
+.overview/search "login" --limit 20              # more results (default: 10)
+```
+
+Output is a single JSON object:
+
 ```json
 {
-  "version": 1,
-  "generated": "2026-05-02T10:00:00Z",
-  "llm": "openai/gpt-oss-20b",
+  "query": "login",
   "files": [
-    { "path": "src/router/router.ts", "description": "Routes requests to LLM based on complexity." },
-    { "path": "src/config.ts", "description": "Loads config from env files and CLI flags." }
-  ]
-}
-```
-
-**`src/router/router.ts.json`** — detailed per-file entry:
-```json
-{
-  "path": "src/router/router.ts",
-  "description": "Routes requests to LLM based on complexity.",
-  "symbols": [
-    { "name": "Router", "type": "class", "description": "Main routing orchestrator", "line": 12 },
-    { "name": "route",  "type": "method", "description": "Routes request to local or Claude LLM", "line": 28 }
+    { "path": "Features/Auth/LoginViewModel.swift", "module": "Auth", "kind": "viewmodel", "description": "login state auth flow", "tags": ["auth","login","session"] }
   ],
-  "imports": ["src/llm/claude.ts", "src/llm/local.ts", "src/config.ts"]
+  "symbols": [
+    { "name": "login", "type": "method", "description": "authenticates user", "file": "Features/Auth/LoginViewModel.swift", "line": 45 }
+  ],
+  "imports": [
+    { "direction": "used_by", "path": "Features/Auth/LoginView.swift" }
+  ]
 }
 ```
 
@@ -75,8 +73,12 @@ npm run dev -- index --dir ./my-project --llm local --local-url http://127.0.0.1
 # Use Claude
 npm run dev -- index --dir ./my-project --llm claude
 
-# Only re-analyze files that have changed
-npm run dev -- index --dir ./my-project --incremental
+# Re-analyze all files (default: skips files whose hash matches the DB)
+npm run dev -- index --dir ./my-project --force
+
+# Search from the CLI
+npm run dev -- search "login"
+npm run dev -- search "AuthService" --only imports
 
 # Show stats for an existing index
 npm run dev -- status
@@ -85,6 +87,10 @@ npm run dev -- status
 npm run build
 node dist/bin/overview.js index --dir ./my-project
 ```
+
+### Stop and resume
+
+Indexing can be interrupted at any time with Ctrl+C. Each file is written to the database immediately after analysis. Restarting without `--force` skips files whose content hash already exists in the database.
 
 ### All options
 
@@ -95,7 +101,7 @@ overview index [options]
   --out <dir>            Output directory (default: .overview)
   --llm <mode>           claude | local | auto (default: auto)
   --concurrency <n>      Parallel LLM calls (default: 3)
-  --incremental          Skip files whose content has not changed
+  --force                Re-analyze all files, ignore cached hashes
   --model <model>        Claude model override
   --local-url <url>      Local LLM server URL (e.g. http://127.0.0.1:1234)
   --local-model <model>  Local LLM model name (auto-detected if omitted)
@@ -124,5 +130,5 @@ Settings are loaded in order: `~/.overview/.env` → `.env` → CLI flags.
 - Binary files are automatically skipped (by extension and content detection)
 - `node_modules`, `.git`, `Pods`, `DerivedData`, `dist`, `build` are always excluded
 - `.gitignore` rules are respected
-- `imports` in per-file JSON contains relative file paths for TS/JS, and module names for Swift/Python
-- The `--incremental` flag uses a SHA-256 hash to skip unchanged files — useful for large codebases
+- The `search` script requires `sqlite3` (available by default on macOS; `brew install sqlite` on Linux)
+- `imports` tracks relative file paths for TS/JS and module names for Swift/Python
