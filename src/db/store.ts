@@ -1,19 +1,35 @@
 import { basename } from 'path';
 import type { SqliteDB } from './schema.js';
 import type { FileDetail } from '../types.js';
+import { expandSearchTerms } from '../search/synonyms.js';
 
 const DEFAULT_LIMIT = 5;
+export const INDEXER_VERSION = '2026-05-04-metadata-v2';
 
-export function isIndexed(db: SqliteDB, path: string, hash: string): boolean {
-  const row = db.prepare('SELECT hash FROM files WHERE path = ?').get(path) as { hash: string } | undefined;
-  return row?.hash === hash;
+export function isIndexed(db: SqliteDB, path: string, hash: string, indexerVersion = INDEXER_VERSION): boolean {
+  const row = db.prepare('SELECT hash, indexer_version FROM files WHERE path = ?').get(path) as {
+    hash: string;
+    indexer_version: string | null;
+  } | undefined;
+  return row?.hash === hash && row.indexer_version === indexerVersion;
 }
 
-export function upsertFile(db: SqliteDB, detail: FileDetail, llm: string): void {
-  const doUpsert = db.transaction((d: FileDetail, model: string) => {
+export function upsertFile(db: SqliteDB, detail: FileDetail, llm: string, indexerVersion = INDEXER_VERSION): void {
+  const doUpsert = db.transaction((d: FileDetail, model: string, version: string) => {
     db.prepare(`
-      INSERT OR REPLACE INTO files (path, module, layer, kind, description, tags, hash, llm, updated_at, has_error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO files (path, module, layer, kind, description, tags, hash, llm, indexer_version, updated_at, has_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        module = excluded.module,
+        layer = excluded.layer,
+        kind = excluded.kind,
+        description = excluded.description,
+        tags = excluded.tags,
+        hash = excluded.hash,
+        llm = excluded.llm,
+        indexer_version = excluded.indexer_version,
+        updated_at = excluded.updated_at,
+        has_error = excluded.has_error
     `).run(
       d.path,
       d.module ?? '',
@@ -23,10 +39,12 @@ export function upsertFile(db: SqliteDB, detail: FileDetail, llm: string): void 
       JSON.stringify(d.tags ?? []),
       d.hash,
       model,
+      version,
       new Date().toISOString(),
       d.error ? 1 : 0,
     );
 
+    db.prepare('DELETE FROM symbols WHERE file_path = ?').run(d.path);
     const insertSym = db.prepare(`
       INSERT INTO symbols (file_path, name, type, description, line) VALUES (?, ?, ?, ?, ?)
     `);
@@ -41,7 +59,7 @@ export function upsertFile(db: SqliteDB, detail: FileDetail, llm: string): void 
     }
   });
 
-  doUpsert(detail, llm);
+  doUpsert(detail, llm, indexerVersion);
 }
 
 export interface FileRow {
@@ -66,9 +84,9 @@ export interface SymbolRow {
   kind: string;
 }
 
-export interface ImportRow {
-  direction: string;
-  path: string;
+export interface ImportSearchResult {
+  uses: string[];
+  used_by: string[];
 }
 
 export interface ModuleSummary {
@@ -89,7 +107,7 @@ export interface SearchResult {
   modules: ModuleSummary[];
   files: FileRow[];
   symbols: SymbolRow[];
-  imports: ImportRow[];
+  imports: ImportSearchResult;
 }
 
 export interface InspectCandidate {
@@ -106,7 +124,7 @@ export interface InspectFileResult {
   symbols: SymbolRow[];
   imports: {
     uses: string[];
-    usedBy: string[];
+    used_by: string[];
   };
   module: ModuleSummary;
 }
@@ -131,28 +149,29 @@ export function search(
   opts: { only?: string; module?: string; kind?: string; limit?: number; withImports?: boolean } = {},
 ): SearchResult {
   const limit = opts.limit ?? DEFAULT_LIMIT;
+  const terms = expandSearchTerms(query);
 
   const files = opts.only && opts.only !== 'files'
     ? []
-    : rankFiles(queryFiles(db, query, opts, candidateLimit(limit)), query).slice(0, limit);
+    : rankFiles(queryFiles(db, terms, opts, candidateLimit(limit)), terms).slice(0, limit);
 
   const symbols = opts.only && opts.only !== 'symbols'
     ? []
-    : rankSymbols(querySymbols(db, query, opts, candidateLimit(limit)), query).slice(0, limit);
+    : rankSymbols(querySymbols(db, terms, opts, candidateLimit(limit)), terms).slice(0, limit);
 
   const modules = opts.only && opts.only !== 'modules'
     ? []
     : rankModules(
       listAllModules(db),
-      query,
+      terms,
       files,
       symbols,
     ).slice(0, limit);
 
   const includeImports = opts.only === 'imports' || Boolean(opts.withImports);
   const imports = includeImports
-    ? rankImports(queryImports(db, query, limit * 2), query).slice(0, limit)
-    : [];
+    ? queryImportRelations(db, terms, limit)
+    : emptyImportSearchResult();
 
   return {
     query,
@@ -259,7 +278,7 @@ export function listModules(
   query = '',
   limit = DEFAULT_LIMIT,
 ): ModuleSummary[] {
-  return rankModules(listAllModules(db), query, [], []).slice(0, limit);
+  return rankModules(listAllModules(db), expandSearchTerms(query), [], []).slice(0, limit);
 }
 
 export function getStats(db: SqliteDB): { files: number; symbols: number; llm: string; updated: string } {
@@ -362,42 +381,48 @@ function buildFileInspectResult(
 
 function queryFiles(
   db: SqliteDB,
-  query: string,
+  terms: string[],
   opts: { module?: string; kind?: string; limit?: number },
   limit: number,
 ): FileRow[] {
-  const normalized = normalize(query);
-  const like = `%${escapeLike(normalized)}%`;
-  const ftsQuery = escapeFtsQuery(query);
   const filterSql = [
     opts.module ? 'AND lower(f.module) = lower(?)' : '',
     opts.kind ? 'AND lower(f.kind) = lower(?)' : '',
   ].filter(Boolean).join(' ');
   const filterParams = [opts.module, opts.kind].filter((value): value is string => Boolean(value));
+  const rows: Array<Omit<FileRow, 'tags'> & { tags: string }> = [];
+  const perTermLimit = Math.max(limit, 20);
 
-  return (db.prepare(`
+  const stmt = db.prepare(`
     SELECT DISTINCT f.path, f.module, f.layer, f.kind, f.description, f.tags, f.llm, f.updated_at, f.has_error
     FROM files f
     WHERE (
       f.rowid IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)
-      OR lower(f.path) LIKE ?
-      OR lower(f.description) LIKE ?
-      OR lower(f.module) LIKE ?
-      OR lower(f.kind) LIKE ?
-      OR EXISTS (SELECT 1 FROM json_each(f.tags) WHERE lower(value) LIKE ?)
+      OR lower(f.path) LIKE ? ESCAPE '\\'
+      OR lower(f.description) LIKE ? ESCAPE '\\'
+      OR lower(f.module) LIKE ? ESCAPE '\\'
+      OR lower(f.kind) LIKE ? ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM json_each(f.tags) WHERE lower(value) LIKE ? ESCAPE '\\')
     )
     ${filterSql}
     LIMIT ?
-  `).all(
-    ftsQuery,
-    like,
-    like,
-    like,
-    like,
-    like,
-    ...filterParams,
-    limit,
-  ) as Array<Omit<FileRow, 'tags'> & { tags: string }>).map((row) => ({
+  `);
+
+  for (const term of terms) {
+    const like = `%${escapeLike(normalize(term))}%`;
+    rows.push(...stmt.all(
+      escapeFtsQuery(term),
+      like,
+      like,
+      like,
+      like,
+      like,
+      ...filterParams,
+      perTermLimit,
+    ) as Array<Omit<FileRow, 'tags'> & { tags: string }>);
+  }
+
+  return dedupe(rows, (row) => row.path).map((row) => ({
     ...row,
     tags: parseTags(row.tags),
   }));
@@ -405,51 +430,98 @@ function queryFiles(
 
 function querySymbols(
   db: SqliteDB,
-  query: string,
+  terms: string[],
   opts: { module?: string; kind?: string; limit?: number },
   limit: number,
 ): SymbolRow[] {
-  const normalized = normalize(query);
-  const like = `%${escapeLike(normalized)}%`;
-  const ftsQuery = escapeFtsQuery(query);
   const filterSql = [
     opts.module ? 'AND lower(f.module) = lower(?)' : '',
     opts.kind ? 'AND lower(f.kind) = lower(?)' : '',
   ].filter(Boolean).join(' ');
   const filterParams = [opts.module, opts.kind].filter((value): value is string => Boolean(value));
+  const rows: SymbolRow[] = [];
+  const perTermLimit = Math.max(limit, 20);
 
-  return db.prepare(`
+  const stmt = db.prepare(`
     SELECT DISTINCT s.name, s.type, s.description, s.line, s.file_path as file, f.module, f.kind
     FROM symbols s
     JOIN files f ON f.path = s.file_path
     WHERE (
       s.id IN (SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?)
-      OR lower(s.name) LIKE ?
-      OR lower(s.description) LIKE ?
-      OR lower(s.file_path) LIKE ?
+      OR lower(s.name) LIKE ? ESCAPE '\\'
+      OR lower(s.description) LIKE ? ESCAPE '\\'
+      OR lower(s.file_path) LIKE ? ESCAPE '\\'
     )
     ${filterSql}
     LIMIT ?
-  `).all(
-    ftsQuery,
-    like,
-    like,
-    like,
-    ...filterParams,
-    limit,
-  ) as SymbolRow[];
+  `);
+
+  for (const term of terms) {
+    const like = `%${escapeLike(normalize(term))}%`;
+    rows.push(...stmt.all(
+      escapeFtsQuery(term),
+      like,
+      like,
+      like,
+      ...filterParams,
+      perTermLimit,
+    ) as SymbolRow[]);
+  }
+
+  return dedupe(rows, (row) => `${row.name}:${row.file}:${row.line ?? ''}`);
 }
 
-function queryImports(db: SqliteDB, query: string, limit: number): ImportRow[] {
-  const likeQuery = `%${query.replace(/%/g, '\\%').replace(/_/g, '\\_')}%`;
-  return db.prepare(`
-    SELECT 'uses' as direction, to_path as path FROM imports
+function queryImportRelations(db: SqliteDB, terms: string[], limit: number): ImportSearchResult {
+  const uses: string[] = [];
+  const usedBy: string[] = [];
+  const perTermLimit = Math.max(limit, 10);
+
+  const usesByPathStmt = db.prepare(`
+    SELECT to_path as path FROM imports
     WHERE from_path LIKE ? ESCAPE '\\'
-    UNION ALL
-    SELECT 'used_by', from_path FROM imports
+    LIMIT ?
+  `);
+  const usesBySymbolStmt = db.prepare(`
+    SELECT DISTINCT i.to_path as path
+    FROM imports i
+    JOIN symbols s ON s.file_path = i.from_path
+    WHERE lower(s.name) = lower(?)
+       OR lower(s.name) LIKE ? ESCAPE '\\'
+    LIMIT ?
+  `);
+  const usedByPathStmt = db.prepare(`
+    SELECT from_path as path FROM imports
     WHERE to_path LIKE ? ESCAPE '\\'
     LIMIT ?
-  `).all(likeQuery, likeQuery, limit) as ImportRow[];
+  `);
+  const usedBySymbolStmt = db.prepare(`
+    SELECT DISTINCT i.from_path as path
+    FROM imports i
+    JOIN symbols s ON s.file_path = i.to_path
+    WHERE lower(s.name) = lower(?)
+       OR lower(s.name) LIKE ? ESCAPE '\\'
+    LIMIT ?
+  `);
+
+  for (const term of terms) {
+    const normalized = normalize(term);
+    if (!normalized) continue;
+
+    const likeQuery = `%${escapeLike(normalized)}%`;
+    uses.push(
+      ...(usesByPathStmt.all(likeQuery, perTermLimit) as Array<{ path: string }>).map((row) => row.path),
+      ...(usesBySymbolStmt.all(normalized, likeQuery, perTermLimit) as Array<{ path: string }>).map((row) => row.path),
+    );
+    usedBy.push(
+      ...(usedByPathStmt.all(likeQuery, perTermLimit) as Array<{ path: string }>).map((row) => row.path),
+      ...(usedBySymbolStmt.all(normalized, likeQuery, perTermLimit) as Array<{ path: string }>).map((row) => row.path),
+    );
+  }
+
+  return {
+    uses: rankImportPaths(dedupeStrings(uses), terms).slice(0, limit),
+    used_by: rankImportPaths(dedupeStrings(usedBy), terms).slice(0, limit),
+  };
 }
 
 function getFileByPath(db: SqliteDB, path: string): FileRow {
@@ -514,7 +586,7 @@ function getSymbolsForFile(db: SqliteDB, filePath: string): SymbolRow[] {
   `).all(filePath) as SymbolRow[];
 }
 
-function getImportsForFile(db: SqliteDB, filePath: string): { uses: string[]; usedBy: string[] } {
+function getImportsForFile(db: SqliteDB, filePath: string): { uses: string[]; used_by: string[] } {
   const uses = db.prepare(`
     SELECT to_path as path
     FROM imports
@@ -533,7 +605,7 @@ function getImportsForFile(db: SqliteDB, filePath: string): { uses: string[]; us
 
   return {
     uses: uses.map((row) => row.path),
-    usedBy: usedBy.map((row) => row.path),
+    used_by: usedBy.map((row) => row.path),
   };
 }
 
@@ -623,40 +695,40 @@ function queryAllFiles(db: SqliteDB): FileRow[] {
   }));
 }
 
-function rankFiles(rows: FileRow[], query: string): FileRow[] {
-  const normalized = normalize(query);
+function rankFiles(rows: FileRow[], terms: string[]): FileRow[] {
+  const normalizedTerms = terms.map(normalize);
   return dedupe(rows, (row) => row.path).sort((a, b) => {
-    const scoreDiff = scoreFile(b, normalized) - scoreFile(a, normalized);
+    const scoreDiff = maxScore(normalizedTerms, (term) => scoreFile(b, term)) - maxScore(normalizedTerms, (term) => scoreFile(a, term));
     if (scoreDiff !== 0) return scoreDiff;
     return a.path.length - b.path.length || a.path.localeCompare(b.path);
   });
 }
 
-function rankSymbols(rows: SymbolRow[], query: string): SymbolRow[] {
-  const normalized = normalize(query);
+function rankSymbols(rows: SymbolRow[], terms: string[]): SymbolRow[] {
+  const normalizedTerms = terms.map(normalize);
   return dedupe(rows, (row) => `${row.name}:${row.file}:${row.line ?? ''}`).sort((a, b) => {
-    const scoreDiff = scoreSymbol(b, normalized) - scoreSymbol(a, normalized);
+    const scoreDiff = maxScore(normalizedTerms, (term) => scoreSymbol(b, term)) - maxScore(normalizedTerms, (term) => scoreSymbol(a, term));
     if (scoreDiff !== 0) return scoreDiff;
     return (a.line ?? 999999) - (b.line ?? 999999) || a.file.localeCompare(b.file);
   });
 }
 
-function rankImports(rows: ImportRow[], query: string): ImportRow[] {
-  const normalized = normalize(query);
-  return dedupe(rows, (row) => `${row.direction}:${row.path}`).sort((a, b) => {
-    const scoreDiff = scoreImport(b, normalized) - scoreImport(a, normalized);
+function rankImportPaths(paths: string[], terms: string[]): string[] {
+  const normalizedTerms = terms.map(normalize);
+  return paths.sort((a, b) => {
+    const scoreDiff = maxScore(normalizedTerms, (term) => scoreImportPath(b, term)) - maxScore(normalizedTerms, (term) => scoreImportPath(a, term));
     if (scoreDiff !== 0) return scoreDiff;
-    return a.path.length - b.path.length || a.path.localeCompare(b.path);
+    return a.length - b.length || a.localeCompare(b);
   });
 }
 
 function rankModules(
   modules: ModuleSummary[],
-  query: string,
+  terms: string[],
   files: FileRow[],
   symbols: SymbolRow[],
 ): ModuleSummary[] {
-  const normalized = normalize(query);
+  const normalizedTerms = terms.map(normalize);
   const fileMatches = new Map<string, number>();
   const symbolMatches = new Map<string, number>();
 
@@ -672,9 +744,9 @@ function rankModules(
       ...module,
       matchedFiles: fileMatches.get(module.module) ?? 0,
       matchedSymbols: symbolMatches.get(module.module) ?? 0,
-      score: scoreModule(module, normalized, fileMatches.get(module.module) ?? 0, symbolMatches.get(module.module) ?? 0),
+      score: maxScore(normalizedTerms, (term) => scoreModule(module, term, fileMatches.get(module.module) ?? 0, symbolMatches.get(module.module) ?? 0)),
     }))
-    .filter((module) => normalized === '' || (module.score ?? 0) > 0)
+    .filter((module) => normalizedTerms.some((term) => term === '') || (module.score ?? 0) > 0)
     .sort((a, b) => {
       const scoreDiff = (b.score ?? 0) - (a.score ?? 0);
       if (scoreDiff !== 0) return scoreDiff;
@@ -717,8 +789,8 @@ function scoreSymbol(symbol: SymbolRow, normalizedQuery: string): number {
   return score;
 }
 
-function scoreImport(row: ImportRow, normalizedQuery: string): number {
-  const path = normalize(row.path);
+function scoreImportPath(rawPath: string, normalizedQuery: string): number {
+  const path = normalize(rawPath);
   if (path === normalizedQuery) return 120;
   if (path.endsWith(normalizedQuery)) return 100;
   if (path.includes(normalizedQuery)) return 60;
@@ -741,6 +813,14 @@ function scoreModule(module: ModuleSummary, normalizedQuery: string, matchedFile
 
 function candidateLimit(limit: number): number {
   return Math.max(limit * 8, 30);
+}
+
+function maxScore(terms: string[], scorer: (term: string) => number): number {
+  return Math.max(0, ...terms.map(scorer));
+}
+
+function emptyImportSearchResult(): ImportSearchResult {
+  return { uses: [], used_by: [] };
 }
 
 function topTagsForFiles(files: FileRow[]): string[] {
@@ -800,4 +880,8 @@ function dedupe<T>(items: T[], keyFn: (item: T) => string): T[] {
     out.push(item);
   }
   return out;
+}
+
+function dedupeStrings(items: string[]): string[] {
+  return dedupe(items, (item) => item);
 }

@@ -2,7 +2,7 @@ You are a code indexer. Analyze the file and return ONLY valid JSON.
 
 Rules:
 - description: 3-6 keywords (NOT a sentence). Example: "login state auth flow"
-- module: the logical module this file belongs to (infer from path or content). Example: "Auth", "Recipes", "Navigation"
+- module: the logical product/module area this file belongs to, not the technical layer. Prefer path/domain names like "Auth", "Recipes", "ShoppingList", "Core" over generic names like "Data", "DI", or "Repository"
 - layer: one of: view|viewmodel|model|api|util|config|test|other
 - kind: one of: view|client|repository|service|model|extension|config|test|other
 - tags: 3-8 relevant search terms as a JSON array. Example: ["auth","login","session","token"]

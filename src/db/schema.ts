@@ -38,6 +38,7 @@ export function initDb(dbPath: string): SqliteDB {
       tags        TEXT,
       hash        TEXT,
       llm         TEXT,
+      indexer_version TEXT,
       updated_at  TEXT,
       has_error   INTEGER DEFAULT 0
     );
@@ -94,6 +95,12 @@ export function initDb(dbPath: string): SqliteDB {
       VALUES ('delete', old.id, old.name, old.description, old.file_path);
     END;
   `);
+
+  try {
+    db.exec('ALTER TABLE files ADD COLUMN indexer_version TEXT;');
+  } catch {
+    // Existing databases already have the column after the first migration.
+  }
 
   return db;
 }

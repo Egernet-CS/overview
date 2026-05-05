@@ -24,7 +24,7 @@ The `search` script can be called directly by an AI agent or from the command li
 
 ```bash
 .overview/search "login"                          # modules + files + symbols matching "login"
-.overview/search "AuthService" --only imports     # who imports AuthService
+.overview/search "AuthService" --only imports     # relation lookup: uses + used_by
 .overview/search "Recipes" --only modules         # compact module summaries
 .overview/search "LoginViewModel" --only symbols  # find a class or function
 .overview/search "auth" --module Norlys           # scoped to one module
@@ -47,7 +47,7 @@ Output is a single JSON object:
   "symbols": [
     { "name": "login", "type": "method", "description": "authenticates user", "file": "Features/Auth/LoginViewModel.swift", "line": 45 }
   ],
-  "imports": []
+  "imports": { "uses": [], "used_by": [] }
 }
 ```
 
@@ -137,6 +137,8 @@ Indexing can be interrupted at any time with Ctrl+C. Each file is written to the
 
 Running `overview index` again updates the existing `.overview/index.db` in place. Unchanged files are skipped automatically based on content hash, so you no longer need a separate incremental mode.
 
+Metadata normalization has its own indexer version. When module/kind/tag rules change, existing rows are refreshed on the next `overview index` run even if file content is unchanged.
+
 ### All options
 
 ```
@@ -178,5 +180,8 @@ Settings are loaded in order: `~/.overview/.env` → `.env` → CLI flags.
 - `.overview/` is generated output and should normally not be committed
 - The `search` script requires `sqlite3` (available by default on macOS; `brew install sqlite` on Linux)
 - The database uses WAL mode and a short busy timeout to make parallel reads more robust
-- Mixed search output omits imports by default to keep responses smaller; use `--with-imports` or `--only imports` when needed
-- `imports` tracks relative file paths for TS/JS and module names for Swift/Python
+- Mixed search output leaves import arrays empty by default to keep responses smaller; use `--with-imports` or `--only imports` when needed
+- Import search output is grouped as `imports.uses` and `imports.used_by`, and also checks matching symbol files, not just literal paths
+- Module, layer, kind, and tags are normalized after LLM analysis so filters stay consistent across casing and naming variants
+- Search expands common domain synonyms such as `popular`/`featured`, `basket`/`cart`, and `auth`/`login`
+- `imports` tracks local file paths for TS/JS and Kotlin when they can be resolved; Swift/Python and unresolved external imports remain as module/package names

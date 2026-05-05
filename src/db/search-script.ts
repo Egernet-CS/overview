@@ -8,7 +8,7 @@ export function generateSearchScript(dbFilename: string): string {
 #   .overview/search "query" --only files     only files
 #   .overview/search "query" --only symbols   only functions/classes
 #   .overview/search "query" --only modules   compact module summaries
-#   .overview/search "query" --only imports   only import relations
+#   .overview/search "query" --only imports   import relations grouped as uses/used_by
 #   .overview/search "query" --module Auth    filter by module
 #   .overview/search "query" --kind view      filter by kind
 #   .overview/search "query" --with-imports   include imports in mixed search output
@@ -39,6 +39,14 @@ json_or_empty() {
     printf '%s\\n' "$1"
   else
     echo "[]"
+  fi
+}
+
+json_or_empty_imports() {
+  if [ -n "$1" ]; then
+    printf '%s\\n' "$1"
+  else
+    echo '{"uses":[],"used_by":[]}'
   fi
 }
 
@@ -80,6 +88,47 @@ fi
 SAFE_QUERY="$(sanitize_literal "$QUERY")"
 SAFE_MODULE="$(sanitize_literal "$MODULE")"
 SAFE_KIND="$(sanitize_literal "$KIND")"
+LOWER_QUERY="$(printf '%s' "$SAFE_QUERY" | tr '[:upper:]' '[:lower:]')"
+
+TERMS=("$SAFE_QUERY")
+add_synonyms() {
+  case "$1" in
+    popular|featured|recommended|recommendation|discovery|discover|highlighted)
+      TERMS+=("popular" "featured" "recommended" "recommendation" "discovery" "discover" "highlighted") ;;
+    recipe|recipes|meal|meals|dish|dishes)
+      TERMS+=("recipe" "recipes" "meal" "meals" "dish" "dishes") ;;
+    basket|cart|shoppingcart|shopping-cart)
+      TERMS+=("basket" "cart" "shoppingcart" "shopping-cart") ;;
+    shopping|shoppinglist|shopping-list|list|lists)
+      TERMS+=("shopping" "shoppinglist" "shopping-list" "list" "lists") ;;
+    auth|authentication|login|signin|sign-in|session|token)
+      TERMS+=("auth" "authentication" "login" "signin" "sign-in" "session" "token") ;;
+    environment|env|configuration|config)
+      TERMS+=("environment" "env" "configuration" "config") ;;
+    customer|user|profile|account)
+      TERMS+=("customer" "user" "profile" "account") ;;
+    offer|offers|campaign|promotion|deal|deals)
+      TERMS+=("offer" "offers" "campaign" "promotion" "deal" "deals") ;;
+    store|shop|retail|location)
+      TERMS+=("store" "shop" "retail" "location") ;;
+    product|products|item|items|sku)
+      TERMS+=("product" "products" "item" "items" "sku") ;;
+  esac
+}
+
+for word in $LOWER_QUERY; do
+  add_synonyms "$word"
+done
+
+FTS_QUERY=""
+for term in "\${TERMS[@]}"; do
+  [ -z "$term" ] && continue
+  if [ -z "$FTS_QUERY" ]; then
+    FTS_QUERY="\\"$term\\""
+  else
+    FTS_QUERY="$FTS_QUERY OR \\"$term\\""
+  fi
+done
 
 MOD_FILTER=""
 KIND_FILTER=""
@@ -114,7 +163,7 @@ FROM (
   WHERE (
     f.rowid IN (
       SELECT rowid FROM files_fts
-      WHERE files_fts MATCH '"$SAFE_QUERY"'
+      WHERE files_fts MATCH '$FTS_QUERY'
     )
     OR lower(f.path) LIKE lower('%$SAFE_QUERY%')
     OR lower(f.description) LIKE lower('%$SAFE_QUERY%')
@@ -165,7 +214,7 @@ FROM (
   WHERE (
     s.id IN (
       SELECT rowid FROM symbols_fts
-      WHERE symbols_fts MATCH '"$SAFE_QUERY"'
+      WHERE symbols_fts MATCH '$FTS_QUERY'
     )
     OR lower(s.name) LIKE lower('%$SAFE_QUERY%')
     OR lower(s.description) LIKE lower('%$SAFE_QUERY%')
@@ -189,19 +238,45 @@ SQL
 
 search_imports() {
   cat <<SQL | run_sql
-SELECT COALESCE(json_group_array(json_object(
-  'direction', direction,
-  'path', path
-)), '[]')
-FROM (
-  SELECT 'uses' AS direction, to_path AS path
-  FROM imports
-  WHERE from_path LIKE '%$SAFE_QUERY%'
-  UNION ALL
-  SELECT 'used_by' AS direction, from_path AS path
-  FROM imports
-  WHERE to_path LIKE '%$SAFE_QUERY%'
-  LIMIT $LIMIT
+SELECT json_object(
+  'uses', json(COALESCE((
+    SELECT json_group_array(path)
+    FROM (
+      SELECT path
+      FROM (
+        SELECT to_path AS path
+        FROM imports
+        WHERE from_path LIKE '%$SAFE_QUERY%'
+        UNION
+        SELECT i.to_path AS path
+        FROM imports i
+        JOIN symbols s ON s.file_path = i.from_path
+        WHERE lower(s.name) = lower('$SAFE_QUERY')
+           OR lower(s.name) LIKE lower('%$SAFE_QUERY%')
+      )
+      ORDER BY length(path), path
+      LIMIT $LIMIT
+    )
+  ), '[]')),
+  'used_by', json(COALESCE((
+    SELECT json_group_array(path)
+    FROM (
+      SELECT path
+      FROM (
+        SELECT from_path AS path
+        FROM imports
+        WHERE to_path LIKE '%$SAFE_QUERY%'
+        UNION
+        SELECT i.from_path AS path
+        FROM imports i
+        JOIN symbols s ON s.file_path = i.to_path
+        WHERE lower(s.name) = lower('$SAFE_QUERY')
+           OR lower(s.name) LIKE lower('%$SAFE_QUERY%')
+      )
+      ORDER BY length(path), path
+      LIMIT $LIMIT
+    )
+  ), '[]'))
 );
 SQL
 }
@@ -251,7 +326,42 @@ FROM (
     WHERE module != ''
     GROUP BY module
   ) m
-  WHERE lower(m.module) LIKE lower('%$SAFE_QUERY%')
+  WHERE (
+    lower(m.module) LIKE lower('%$SAFE_QUERY%')
+    OR EXISTS (
+      SELECT 1
+      FROM files f
+      WHERE f.module = m.module
+        AND (
+          f.rowid IN (
+            SELECT rowid FROM files_fts
+            WHERE files_fts MATCH '$FTS_QUERY'
+          )
+          OR lower(f.path) LIKE lower('%$SAFE_QUERY%')
+          OR lower(f.description) LIKE lower('%$SAFE_QUERY%')
+          OR EXISTS (
+            SELECT 1
+            FROM json_each(f.tags)
+            WHERE lower(value) LIKE lower('%$SAFE_QUERY%')
+          )
+        )
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM symbols s
+      JOIN files f ON f.path = s.file_path
+      WHERE f.module = m.module
+        AND (
+          s.id IN (
+            SELECT rowid FROM symbols_fts
+            WHERE symbols_fts MATCH '$FTS_QUERY'
+          )
+          OR lower(s.name) LIKE lower('%$SAFE_QUERY%')
+          OR lower(s.description) LIKE lower('%$SAFE_QUERY%')
+          OR lower(s.file_path) LIKE lower('%$SAFE_QUERY%')
+        )
+    )
+  )
   ORDER BY
     CASE
       WHEN lower(m.module) = lower('$SAFE_QUERY') THEN 3
@@ -280,7 +390,7 @@ case "$ONLY" in
     ;;
   imports)
     IMPORTS="$(search_imports)"
-    printf '{"query":"%s","imports":%s}\\n' "$QUERY" "$(json_or_empty "$IMPORTS")"
+    printf '{"query":"%s","imports":%s}\\n' "$QUERY" "$(json_or_empty_imports "$IMPORTS")"
     ;;
   "")
     MODULES="$(search_modules)"
@@ -289,9 +399,9 @@ case "$ONLY" in
     if [ "$WITH_IMPORTS" = "1" ]; then
       IMPORTS="$(search_imports)"
       printf '{"query":"%s","modules":%s,"files":%s,"symbols":%s,"imports":%s}\\n' \\
-        "$QUERY" "$(json_or_empty "$MODULES")" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")" "$(json_or_empty "$IMPORTS")"
+        "$QUERY" "$(json_or_empty "$MODULES")" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")" "$(json_or_empty_imports "$IMPORTS")"
     else
-      printf '{"query":"%s","modules":%s,"files":%s,"symbols":%s,"imports":[]}\\n' \\
+      printf '{"query":"%s","modules":%s,"files":%s,"symbols":%s,"imports":{"uses":[],"used_by":[]}}\\n' \\
         "$QUERY" "$(json_or_empty "$MODULES")" "$(json_or_empty "$FILES")" "$(json_or_empty "$SYMBOLS")"
     fi
     ;;

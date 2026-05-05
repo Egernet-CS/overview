@@ -5,6 +5,7 @@ import type { LlmClient, LlmFileAnalysis, FileDetail, FileSymbol, ScannedFile, P
 import { truncateContent } from '../scanner/chunker.js';
 import { extractImports } from '../scanner/importer.js';
 import { hashContent } from './cache.js';
+import { normalizeFileDetail } from './metadata.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -55,7 +56,7 @@ export class FileAnalyzer {
     const imports = extractImports(file.absolutePath, content, this.config.rootDir);
 
     if (!analysis) {
-      const detail: FileDetail = {
+      const detail: FileDetail = normalizeFileDetail({
         path: file.relativePath,
         module: inferModule(file.relativePath),
         layer: 'other',
@@ -66,7 +67,7 @@ export class FileAnalyzer {
         imports,
         hash,
         error: lastError,
-      };
+      });
       return { status: 'ok', detail };
     }
 
@@ -77,7 +78,7 @@ export class FileAnalyzer {
       ...(s.line !== undefined ? { line: s.line } : {}),
     }));
 
-    const detail: FileDetail = {
+    const detail: FileDetail = normalizeFileDetail({
       path: file.relativePath,
       module: analysis.module ?? inferModule(file.relativePath),
       layer: analysis.layer ?? 'other',
@@ -87,7 +88,7 @@ export class FileAnalyzer {
       symbols,
       imports,
       hash,
-    };
+    });
 
     return { status: 'ok', detail };
   }

@@ -12,7 +12,7 @@ import { FileAnalyzer } from '../src/indexer/analyzer.js';
 import { Semaphore } from '../src/indexer/concurrency.js';
 import { hashContent } from '../src/indexer/cache.js';
 import { initDb } from '../src/db/schema.js';
-import { isIndexed, upsertFile, search, inspect, listModules, getStats } from '../src/db/store.js';
+import { INDEXER_VERSION, isIndexed, upsertFile, search, inspect, listModules, getStats } from '../src/db/store.js';
 import { generateSearchScript } from '../src/db/search-script.js';
 import { buildSnippet } from '../src/inspect/snippet.js';
 import type { LlmClient, OverviewConfig } from '../src/types.js';
@@ -92,7 +92,7 @@ program
 
       const hash = hashContent(content);
 
-      if (!config.force && isIndexed(db, file.relativePath, hash)) {
+      if (!config.force && isIndexed(db, file.relativePath, hash, INDEXER_VERSION)) {
         cached++;
         done++;
         printProgress(done, files.length, cached, errors);
@@ -103,7 +103,7 @@ program
       done++;
 
       if (result.status === 'ok') {
-        upsertFile(db, result.detail, llmClient.getModelName());
+        upsertFile(db, result.detail, llmClient.getModelName(), INDEXER_VERSION);
         if (result.detail.error) errors++;
       } else if (result.status === 'error') {
         errors++;
@@ -137,7 +137,7 @@ program
   .option('--only <type>', 'files | symbols | imports | modules')
   .option('--module <name>', 'Filter by module')
   .option('--kind <kind>', 'Filter by kind (view, viewmodel, client, ...)')
-  .option('--with-imports', 'Include import relations in default search output')
+  .option('--with-imports', 'Include import relations grouped as uses/used_by in default search output')
   .option('--limit <n>', 'Max results per section', parseInt)
   .action(async (query: string, opts: {
     out?: string; only?: string; module?: string; kind?: string; limit?: number; withImports?: boolean;
